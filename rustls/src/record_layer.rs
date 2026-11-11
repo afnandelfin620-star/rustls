@@ -20,6 +20,10 @@ enum DirectionState {
 
 /// Record layer that tracks decryption and encryption keys.
 pub(crate) struct RecordLayer {
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) l5_special: bool,
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) l5_records: [u64; 2],
     message_encrypter: Box<dyn MessageEncrypter>,
     message_decrypter: Box<dyn MessageDecrypter>,
     write_seq_max: u64,
@@ -39,6 +43,10 @@ impl RecordLayer {
     /// Create new record layer with no keys.
     pub(crate) fn new() -> Self {
         Self {
+            #[cfg(feature = "l5-experimental")]
+            l5_special: false,
+            #[cfg(feature = "l5-experimental")]
+            l5_records: [0; 2],
             message_encrypter: <dyn MessageEncrypter>::invalid(),
             message_decrypter: <dyn MessageDecrypter>::invalid(),
             write_seq_max: 0,
@@ -60,6 +68,18 @@ impl RecordLayer {
         &mut self,
         encr: InboundOpaqueMessage<'a>,
     ) -> Result<Option<Decrypted<'a>>, Error> {
+        #[cfg(feature = "l5-experimental")]
+        if encr.typ == crate::enums::ContentType::Unknown(126) {
+            if !self.l5_special || self.decrypt_state != DirectionState::Active
+                || encr.version != crate::enums::ProtocolVersion::TLSv1_2
+                || encr.payload.is_empty() || encr.payload.len() > 16384 {
+                return Err(Error::General("unnegotiated or invalid L5 record".into()));
+            }
+            let mut plaintext = encr.into_plain_message();
+            plaintext.typ = crate::enums::ContentType::ApplicationData;
+            self.l5_records[0] = self.l5_records[0].saturating_add(1);
+            return Ok(Some(Decrypted { want_close_before_decrypt: false, plaintext }));
+        }
         if self.decrypt_state != DirectionState::Active {
             return Ok(Some(Decrypted {
                 want_close_before_decrypt: false,
@@ -109,6 +129,14 @@ impl RecordLayer {
         plain: OutboundPlainMessage<'_>,
     ) -> OutboundOpaqueMessage {
         debug_assert!(self.encrypt_state == DirectionState::Active);
+        #[cfg(feature = "l5-experimental")]
+        if self.l5_special && plain.typ == crate::enums::ContentType::ApplicationData {
+            let mut record = plain.to_unencrypted_opaque();
+            record.typ = crate::enums::ContentType::Unknown(126);
+            record.version = crate::enums::ProtocolVersion::TLSv1_2;
+            self.l5_records[1] = self.l5_records[1].saturating_add(1);
+            return record;
+        }
         assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
         let seq = self.write_seq;
         self.write_seq += 1;

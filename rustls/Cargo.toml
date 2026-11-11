@@ -15,6 +15,8 @@ exclude = ["src/testdata", "tests/**"]
 build = "build.rs"
 
 [features]
+l5-experimental = ["std", "dep:bytes"]
+l5-openssl-serverhello = []
 default = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]
 
 aws-lc-rs = ["aws_lc_rs"] # Alias because Cargo features commonly use `-`
@@ -34,6 +36,7 @@ zlib = ["dep:zlib-rs"]
 rustversion = { version = "1.0.6", optional = true }
 
 [dependencies]
+bytes = { version = "1", optional = true }
 aws-lc-rs = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 brotli-decompressor = { workspace = true, optional = true }

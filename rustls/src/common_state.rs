@@ -50,6 +50,8 @@ pub struct CommonState {
     pub(crate) peer_certificates: Option<CertificateChain<'static>>,
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) l5_capture_plaintext: bool,
     pub(crate) sendable_tls: ChunkVecBuffer,
     queued_key_update_message: Option<Vec<u8>>,
 
@@ -64,6 +66,32 @@ pub struct CommonState {
 }
 
 impl CommonState {
+    /// Enable the private L5 record experiment on an authenticated, negotiated connection.
+    ///
+    /// WARNING: subsequent application records have NO TLS encryption or authentication.
+    /// The caller MUST authenticate every application frame before acting on its contents.
+    /// This is not standard TLS, not suitable for generic HTTPS, and never enabled implicitly.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_enable_special(&mut self) -> Result<(), Error> {
+        if self.is_handshaking() || self.negotiated_version != Some(ProtocolVersion::TLSv1_3)
+            || self.has_sent_close_notify || self.has_received_close_notify || self.wants_write() {
+            return Err(Error::General("L5 switch requires established TLS 1.3 and flushed output".into()));
+        }
+        self.record_layer.l5_special = true;
+        Ok(())
+    }
+
+    /// Promote deferred TLS control output without writing to the socket.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_prepare_control_output(&mut self) -> bool {
+        self.perhaps_write_key_update();
+        self.wants_write()
+    }
+
+    /// Returns [received, sent] private L5 record counts, for prototype verification.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_record_counts(&self) -> [u64; 2] { self.record_layer.l5_records }
+
     pub(crate) fn new(side: Side) -> Self {
         Self {
             negotiated_version: None,
@@ -85,6 +113,8 @@ impl CommonState {
             peer_certificates: None,
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
+            #[cfg(feature = "l5-experimental")]
+            l5_capture_plaintext: false,
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
             queued_key_update_message: None,
             protocol: Protocol::Tcp,
@@ -553,6 +583,8 @@ impl CommonState {
 
     pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
         self.temper_counters.received_app_data();
+        #[cfg(feature = "l5-experimental")]
+        if self.l5_capture_plaintext { return; }
         self.received_plaintext
             .append(bytes.into_vec());
     }

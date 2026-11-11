@@ -7,6 +7,10 @@ use std::io;
 #[cfg(feature = "std")]
 use crate::msgs::message::MAX_WIRE_SIZE;
 
+/// l5droid patch: maximum bytes requested per socket read (upstream: 4 KiB).
+#[cfg(feature = "std")]
+const L5_READ_LIMIT: usize = 16 * 1024;
+
 /// Conversion from a slice within a larger buffer into
 /// a `Range` offset within.
 #[derive(Debug)]
@@ -153,43 +157,68 @@ pub(crate) struct DeframerVecBuffer {
     ///
     /// For buffer size management, checkout out the [`DeframerVecBuffer::prepare_read()`] method.
     buf: Vec<u8>,
+    #[cfg(feature = "l5-experimental")]
+    pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+
+    /// l5droid patch: start of the not-yet-discarded data. `discard()` only
+    /// advances this offset; the pending bytes are moved to the front once per
+    /// read (in `compact()`), instead of once per processed record.
+    start: usize,
 
     /// What size prefix of `buf` is used.
     used: usize,
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) l5_capacity: usize,
 }
 
 impl DeframerVecBuffer {
-    /// Discard `taken` bytes from the start of our buffer.
-    pub(crate) fn discard(&mut self, taken: usize) {
-        #[allow(clippy::comparison_chain)]
-        if taken < self.used {
-            /* Before:
-             * +----------+----------+----------+
-             * | taken    | pending  |xxxxxxxxxx|
-             * +----------+----------+----------+
-             * 0          ^ taken    ^ self.used
-             *
-             * After:
-             * +----------+----------+----------+
-             * | pending  |xxxxxxxxxxxxxxxxxxxxx|
-             * +----------+----------+----------+
-             * 0          ^ self.used
-             */
+    /// Transfer a whole receive allocation, keeping only an incomplete trailing
+    /// record in the next slab. No application payload is copied or compacted.
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) fn detach_prefix(&mut self, taken: usize) -> bytes::Bytes {
+        assert!(taken <= self.used - self.start);
+        let end = self.start + taken;
+        let remaining = self.used - end;
+        let size = self.buf.len();
+        let mut next = self.pool.lock().unwrap().pop().unwrap_or_default();
+        next.resize(size, 0); // Recycled slabs already have this size: no memset.
+        next[..remaining].copy_from_slice(&self.buf[end..self.used]);
+        let old = mem::replace(&mut self.buf, next);
+        let start = mem::take(&mut self.start);
+        self.used = remaining;
+        bytes::Bytes::from_owner(ReceiveSlab { buf: old, pool: self.pool.clone() }).slice(start..end)
+    }
 
-            self.buf
-                .copy_within(taken..self.used, 0);
-            self.used -= taken;
-        } else if taken >= self.used {
+    /// Discard `taken` bytes from the start of our buffer.
+    ///
+    /// Observable behaviour is unchanged from upstream: `filled()` afterwards
+    /// starts `taken` bytes later. Only the data movement is deferred.
+    pub(crate) fn discard(&mut self, taken: usize) {
+        if taken < self.used - self.start {
+            self.start += taken;
+        } else {
+            self.start = 0;
             self.used = 0;
         }
     }
 
     pub(crate) fn filled_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.used]
+        &mut self.buf[self.start..self.used]
     }
 
     pub(crate) fn filled(&self) -> &[u8] {
-        &self.buf[..self.used]
+        &self.buf[self.start..self.used]
+    }
+
+    /// Move pending bytes to the front of `buf`.
+    #[cfg(feature = "std")]
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buf
+                .copy_within(self.start..self.used, 0);
+            self.used -= self.start;
+            self.start = 0;
+        }
     }
 }
 
@@ -205,7 +234,15 @@ impl DeframerVecBuffer {
         // we get a message with a length field out of range here,
         // we do a zero length read.  That looks like an EOF to
         // the next layer up, which is fine.
-        let new_bytes = rd.read(&mut self.buf[self.used..])?;
+        //
+        // l5droid patch: each read is capped at `L5_READ_LIMIT` (tunable; on-device
+        // CPU-time measurements of 4 KiB vs 64 KiB were dominated by noise in
+        // kernel-time attribution, so the value is being evaluated empirically).
+        let mut read_limit = L5_READ_LIMIT;
+        #[cfg(feature = "l5-experimental")]
+        if self.l5_capacity > 0 { read_limit = self.l5_capacity; }
+        let end = Ord::min(self.buf.len(), self.used + read_limit);
+        let new_bytes = rd.read(&mut self.buf[self.used..end])?;
         self.used += new_bytes;
         Ok(new_bytes)
     }
@@ -219,6 +256,20 @@ impl DeframerVecBuffer {
 
         const READ_SIZE: usize = 4096;
 
+        // l5droid patch: outside handshake joining, keep one fixed buffer (no
+        // shrink to 4 KiB whenever it drains followed by realloc + zero-fill on
+        // the next record) and only move pending bytes to the front when the
+        // tail has no room for a full read, instead of once per record.
+        let mut data_buffer_size: usize = 64 * 1024 + MAX_WIRE_SIZE;
+        let mut read_limit = L5_READ_LIMIT;
+        #[cfg(feature = "l5-experimental")]
+        if self.l5_capacity > 0 { data_buffer_size = self.l5_capacity + MAX_WIRE_SIZE; read_limit = self.l5_capacity; }
+
+        // Handshake joining keeps upstream's exact logic on a compacted buffer.
+        if is_joining_hs || self.buf.len() > data_buffer_size {
+            self.compact();
+        }
+
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
         // by varying the maximum allowed buffer size here based on whether a prefix of a
         // handshake payload is currently being buffered. Given that the first read of such a
@@ -228,24 +279,32 @@ impl DeframerVecBuffer {
         // At this point, the buffer resizing logic below should reduce the buffer size.
         let allow_max = match is_joining_hs {
             true => MAX_HANDSHAKE_SIZE as usize,
-            false => MAX_WIRE_SIZE,
+            false => data_buffer_size,
         };
 
-        if self.used >= allow_max {
+        if self.used - self.start >= allow_max {
             return Err("message buffer full");
         }
 
-        // If we can and need to increase the buffer size to allow a 4k read, do so. After
-        // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
-        // make sure to reduce the buffer size again (large messages should be rare).
-        // Also, reduce the buffer size if there are neither full nor partial messages in it,
-        // which usually means that the other side suspended sending data.
-        let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+        // Handshake joining keeps upstream's incremental 4k growth. Otherwise the
+        // buffer is sized to `DATA_BUFFER_SIZE` once and kept. If a large handshake
+        // message left it bigger than `allow_max`, reduce it again (large messages
+        // should be rare); the buffer was compacted above and `used < allow_max`,
+        // so no buffered bytes are lost.
+        let need_capacity = match is_joining_hs {
+            true => Ord::min(allow_max, self.used + READ_SIZE),
+            false => allow_max,
+        };
         if need_capacity > self.buf.len() {
             self.buf.resize(need_capacity, 0);
-        } else if self.used == 0 || self.buf.len() > allow_max {
+        } else if self.buf.len() > allow_max {
             self.buf.resize(need_capacity, 0);
             self.buf.shrink_to(need_capacity);
+        }
+
+        // Pending data is < one record, so after compaction there is always room.
+        if self.buf.len() - self.used < read_limit {
+            self.compact();
         }
 
         Ok(())
@@ -255,6 +314,7 @@ impl DeframerVecBuffer {
     ///
     /// Return a `Range` saying where it went.
     pub(crate) fn extend(&mut self, bytes: &[u8]) -> Range<usize> {
+        self.compact();
         let len = bytes.len();
         let start = self.used;
         let end = start + len;
@@ -264,6 +324,22 @@ impl DeframerVecBuffer {
         self.buf[start..end].copy_from_slice(bytes);
         self.used += len;
         Range { start, end }
+    }
+}
+
+#[cfg(feature = "l5-experimental")]
+struct ReceiveSlab {
+    buf: Vec<u8>,
+    pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+#[cfg(feature = "l5-experimental")]
+impl AsRef<[u8]> for ReceiveSlab { fn as_ref(&self) -> &[u8] { &self.buf } }
+#[cfg(feature = "l5-experimental")]
+impl Drop for ReceiveSlab {
+    fn drop(&mut self) {
+        let mut pool = self.pool.lock().unwrap();
+        // A reuse cache, not a traffic/queue budget. Live slabs remain owned by Bytes.
+        if pool.len() < 4 { pool.push(mem::take(&mut self.buf)); }
     }
 }
 

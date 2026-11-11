@@ -9,6 +9,19 @@ use std::io::Read;
 #[cfg(feature = "std")]
 use crate::msgs::message::OutboundChunks;
 
+// Keep ordinary TLS buffers as Vec. Only the L5 receive path shares slabs.
+#[cfg(not(feature = "l5-experimental"))]
+type Chunk = Vec<u8>;
+#[cfg(feature = "l5-experimental")]
+enum Chunk { Owned(Vec<u8>), Shared(bytes::Bytes) }
+#[cfg(feature = "l5-experimental")]
+impl From<Vec<u8>> for Chunk { fn from(v: Vec<u8>) -> Self { Self::Owned(v) } }
+#[cfg(feature = "l5-experimental")]
+impl core::ops::Deref for Chunk {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { Self::Owned(v) => v, Self::Shared(b) => b } }
+}
+
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
 /// This avoids extra copies when appending a new byte vector,
@@ -20,7 +33,7 @@ pub(crate) struct ChunkVecBuffer {
     /// Invariant: 0 <= `prefix_used` < `chunks[0].len()`
     prefix_used: usize,
 
-    chunks: VecDeque<Vec<u8>>,
+    chunks: VecDeque<Chunk>,
 
     /// The total upper limit (in bytes) of this object.
     limit: Option<usize>,
@@ -80,7 +93,7 @@ impl ChunkVecBuffer {
                 debug_assert_eq!(self.prefix_used, 0);
             }
 
-            self.chunks.push_back(bytes);
+            self.chunks.push_back(bytes.into());
         }
 
         len
@@ -90,15 +103,26 @@ impl ChunkVecBuffer {
     ///
     /// This function returns `None` if the object `is_empty`.
     pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
-        let mut first = self.chunks.pop_front();
+        let first = self.chunks.pop_front()?;
+        let prefix = mem::take(&mut self.prefix_used);
+        #[cfg(feature = "l5-experimental")]
+        let mut first = match first { Chunk::Owned(v) => v, Chunk::Shared(b) => b.to_vec() };
+        #[cfg(not(feature = "l5-experimental"))]
+        let mut first = first;
+        first.drain(0..prefix);
+        Some(first)
+    }
 
-        if let Some(first) = &mut first {
-            // slice off `prefix_used` if needed (uncommon)
-            let prefix = mem::take(&mut self.prefix_used);
-            first.drain(0..prefix);
-        }
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) fn append_shared(&mut self, bytes: bytes::Bytes) {
+        if !bytes.is_empty() { self.chunks.push_back(Chunk::Shared(bytes)); }
+    }
 
-        first
+    #[cfg(feature = "l5-experimental")]
+    pub(crate) fn pop_shared(&mut self) -> Option<bytes::Bytes> {
+        let chunk = self.chunks.pop_front()?;
+        let bytes = match chunk { Chunk::Owned(v) => bytes::Bytes::from(v), Chunk::Shared(b) => b };
+        Some(bytes.slice(mem::take(&mut self.prefix_used)..))
     }
 
     #[cfg(read_buf)]
@@ -121,7 +145,7 @@ impl ChunkVecBuffer {
     pub(crate) fn peek(&self) -> Option<&[u8]> {
         self.chunks
             .front()
-            .map(|ch| ch.as_slice())
+            .map(|ch| &ch[..])
     }
 }
 

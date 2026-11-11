@@ -1300,7 +1300,20 @@ impl<'a> Codec<'a> for ServerExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
+        // L5: observed OpenSSL 3.5.5 TLS 1.3 ServerHello sends selected_version
+        // before key_share. Only reorder this field; no change to negotiation,
+        // cryptography, ClientHello, or EncryptedExtensions. This is NOT a claim
+        // of complete OpenSSL fingerprint equivalence.
+        #[cfg(feature = "l5-openssl-serverhello")]
+        if self.selected_version == Some(ProtocolVersion::TLSv1_3) {
+            self.encode_one(ExtensionType::SupportedVersions, extensions.buf);
+        }
         for ext in Self::ALL_EXTENSIONS {
+            #[cfg(feature = "l5-openssl-serverhello")]
+            if self.selected_version == Some(ProtocolVersion::TLSv1_3)
+                && *ext == ExtensionType::SupportedVersions {
+                continue;
+            }
             self.encode_one(*ext, extensions.buf);
         }
     }

@@ -277,7 +277,11 @@ pub(crate) fn read_opaque_message_header(
     let typ = ContentType::read(r).map_err(|_| MessageError::TooShortForHeader)?;
     // Don't accept any new content-types.
     if let ContentType::Unknown(_) = typ {
-        return Err(MessageError::InvalidContentType);
+        // L5 experimental record: accepted by the parser only. RecordLayer rejects
+        // it unless this particular connection explicitly opted in after TLS 1.3.
+        if !cfg!(feature = "l5-experimental") || typ != ContentType::Unknown(126) {
+            return Err(MessageError::InvalidContentType);
+        }
     }
 
     let version = ProtocolVersion::read(r).map_err(|_| MessageError::TooShortForHeader)?;

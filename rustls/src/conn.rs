@@ -178,6 +178,16 @@ mod connection {
     }
 
     impl<'a> Reader<'a> {
+        /// Take ownership of the next plaintext chunk without copying it.
+        /// Special L5 records share the socket receive slab; ordinary TLS Vec
+        /// chunks are transferred without copying as well.
+        #[cfg(feature = "l5-experimental")]
+        pub fn l5_take_chunk(&mut self) -> io::Result<bytes::Bytes> {
+            if let Some(bytes) = self.received_plaintext.pop_shared() { return Ok(bytes); }
+            self.check_no_bytes_state()?;
+            Ok(bytes::Bytes::new())
+        }
+
         /// Check the connection's state if no bytes are available for reading.
         fn check_no_bytes_state(&self) -> io::Result<()> {
             match (self.has_received_close_notify, self.has_seen_eof) {
@@ -495,6 +505,42 @@ impl<Data> ConnectionCommon<Data> {
     /// Should be used with care as it exposes secret key material.
     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
         self.core.dangerous_extract_secrets()
+    }
+
+    /// Configure L5 user-space TLS receive and transmit capacities after handshake.
+    /// Keeps cursor-based discard; does not add an extra BufStream copying layer.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_set_io_capacity(&mut self, capacity: usize) -> Result<(), Error> {
+        if !(64 * 1024..=16 * 1024 * 1024).contains(&capacity) {
+            return Err(Error::General("invalid L5 IO capacity".into()));
+        }
+        self.deframer_buffer.l5_capacity = capacity;
+        self.core.common_state.received_plaintext.set_limit(Some(capacity));
+        self.set_buffer_limit(Some(capacity));
+        Ok(())
+    }
+
+    /// Whether the peer sent a TLS close_notify.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_peer_closed(&self) -> bool { self.core.common_state.has_received_close_notify }
+
+    /// Move handshake read-ahead to the caller's fixed receive buffer once.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_take_buffered_tls(&mut self) -> alloc::vec::Vec<u8> {
+        let bytes = self.deframer_buffer.filled().to_vec();
+        self.deframer_buffer = DeframerVecBuffer::default();
+        bytes
+    }
+
+    /// Process caller-owned TLS storage without transferring or copying payload.
+    /// Returned ranges borrow this storage logically, until the caller consumes
+    /// them. Only the returned consumed prefix may subsequently be compacted.
+    #[cfg(feature = "l5-experimental")]
+    pub fn l5_process_external(&mut self, buffer: &mut [u8], spans: &mut alloc::vec::Vec<Range<usize>>) -> Result<usize, Error> {
+        if !self.core.common_state.record_layer.l5_special {
+            return Err(Error::General("external receive requires negotiated special TLS".into()));
+        }
+        self.core.l5_process_external(buffer, spans, &mut self.sendable_plaintext)
     }
 
     /// Sets a limit on the internal buffers used to buffer
@@ -917,11 +963,20 @@ impl<Data> ConnectionCore<Data> {
         };
 
         let mut buffer_progress = self.hs_deframer.progress();
+        #[cfg(feature = "l5-experimental")]
+        let shared = self.common_state.record_layer.l5_special;
+        #[cfg(not(feature = "l5-experimental"))]
+        let shared = false;
+        let mut deferred_discard = 0;
+        #[cfg(feature = "l5-experimental")]
+        let mut spans = alloc::vec::Vec::new();
 
         loop {
+            #[cfg(feature = "l5-experimental")]
+            let locator = Locator::new(deframer_buffer.filled());
             let res = self.deframe(
                 Some(&*state),
-                deframer_buffer.filled_mut(),
+                &mut deframer_buffer.filled_mut()[deferred_discard..],
                 &mut buffer_progress,
             );
 
@@ -929,7 +984,7 @@ impl<Data> ConnectionCore<Data> {
                 Ok(opt_msg) => opt_msg,
                 Err(e) => {
                     self.state = Err(e.clone());
-                    deframer_buffer.discard(buffer_progress.take_discard());
+                    deframer_buffer.discard(deferred_discard + buffer_progress.take_discard());
                     return Err(e);
                 }
             };
@@ -938,11 +993,25 @@ impl<Data> ConnectionCore<Data> {
                 break;
             };
 
-            match self.process_msg(msg, state, Some(sendable_plaintext)) {
+            #[cfg(feature = "l5-experimental")]
+            {
+                // Keep the normal TLS state handler and temper counters. Capture
+                // only its already-validated application-data delivery, then
+                // transfer ownership after all borrows into the slab have ended.
+                self.common_state.l5_capture_plaintext = shared
+                    && msg.typ == ContentType::ApplicationData;
+                if self.common_state.l5_capture_plaintext {
+                    spans.push(locator.locate(msg.payload));
+                }
+            }
+            let result = self.process_msg(msg, state, Some(sendable_plaintext));
+            #[cfg(feature = "l5-experimental")]
+            { self.common_state.l5_capture_plaintext = false; }
+            match result {
                 Ok(new) => state = new,
                 Err(e) => {
                     self.state = Err(e.clone());
-                    deframer_buffer.discard(buffer_progress.take_discard());
+                    deframer_buffer.discard(deferred_discard + buffer_progress.take_discard());
                     return Err(e);
                 }
             }
@@ -954,16 +1023,109 @@ impl<Data> ConnectionCore<Data> {
                 // "Any data received after a closure alert has been received MUST be ignored."
                 // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
                 // This is data that has already been accepted in `read_tls`.
-                buffer_progress.add_discard(deframer_buffer.filled().len());
+                buffer_progress.add_discard(deframer_buffer.filled().len().saturating_sub(deferred_discard + buffer_progress.processed()));
                 break;
             }
 
-            deframer_buffer.discard(buffer_progress.take_discard());
+            let discard = buffer_progress.take_discard();
+            if shared { deferred_discard += discard; } else { deframer_buffer.discard(discard); }
         }
 
-        deframer_buffer.discard(buffer_progress.take_discard());
+        let discard = deferred_discard + buffer_progress.take_discard();
+        #[cfg(feature = "l5-experimental")]
+        if !spans.is_empty() {
+            let slab = deframer_buffer.detach_prefix(discard);
+            for span in spans { self.common_state.received_plaintext.append_shared(slab.slice(span)); }
+        } else { deframer_buffer.discard(discard); }
+        #[cfg(not(feature = "l5-experimental"))]
+        deframer_buffer.discard(discard);
         self.state = Ok(state);
         Ok(self.common_state.current_io_state())
+    }
+
+    #[cfg(feature = "l5-experimental")]
+    fn l5_process_external(
+        &mut self,
+        buffer: &mut [u8],
+        spans: &mut alloc::vec::Vec<Range<usize>>,
+        sendable_plaintext: &mut ChunkVecBuffer,
+    ) -> Result<usize, Error> {
+        let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
+            Ok(state) => state,
+            Err(e) => {
+                self.state = Err(e.clone());
+                return Err(e);
+            }
+        };
+
+        let mut buffer_progress = self.hs_deframer.progress();
+        let shared = true;
+        let mut deferred_discard = 0;
+        spans.clear();
+
+        loop {
+            #[cfg(feature = "l5-experimental")]
+            let locator = Locator::new(buffer);
+            let res = self.deframe(
+                Some(&*state),
+                &mut buffer[deferred_discard..],
+                &mut buffer_progress,
+            );
+
+            let opt_msg = match res {
+                Ok(opt_msg) => opt_msg,
+                Err(e) => {
+                    self.state = Err(e.clone());
+                    spans.clear();
+                    return Err(e);
+                }
+            };
+
+            let Some(msg) = opt_msg else {
+                break;
+            };
+
+            #[cfg(feature = "l5-experimental")]
+            {
+                // Keep the normal TLS state handler and temper counters. Capture
+                // only its already-validated application-data delivery, then
+                // transfer ownership after all borrows into the slab have ended.
+                self.common_state.l5_capture_plaintext = shared
+                    && msg.typ == ContentType::ApplicationData;
+                if self.common_state.l5_capture_plaintext {
+                    spans.push(locator.locate(msg.payload));
+                }
+            }
+            let result = self.process_msg(msg, state, Some(sendable_plaintext));
+            #[cfg(feature = "l5-experimental")]
+            { self.common_state.l5_capture_plaintext = false; }
+            match result {
+                Ok(new) => state = new,
+                Err(e) => {
+                    self.state = Err(e.clone());
+                    spans.clear();
+                    return Err(e);
+                }
+            }
+
+            if self
+                .common_state
+                .has_received_close_notify
+            {
+                // "Any data received after a closure alert has been received MUST be ignored."
+                // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
+                // This is data that has already been accepted in `read_tls`.
+                buffer_progress.add_discard(buffer.len().saturating_sub(deferred_discard + buffer_progress.processed()));
+                break;
+            }
+
+            let discard = buffer_progress.take_discard();
+            deferred_discard += discard;
+        }
+
+        let discard = deferred_discard + buffer_progress.take_discard();
+        self.state = Ok(state);
+        Ok(discard)
     }
 
     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
